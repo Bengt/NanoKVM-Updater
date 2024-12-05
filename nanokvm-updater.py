@@ -23,6 +23,21 @@ class FirmwareUpdater:
         )
         self.logger = logging.getLogger(__name__)
 
+    def service_control(self, action: str):
+        """Control the nanokvm service."""
+        try:
+            cmd = f"/etc/init.d/{self.service_name} {action}"
+            result = run(cmd, shell=True, stdout=PIPE, stderr=STDOUT, text=True)
+            
+            if result.returncode != 0:
+                self.logger.error(f"Service {action} failed with code {result.returncode}: {result.stdout}")
+                raise RuntimeError(f"Service {action} failed")
+            
+            self.logger.info(f"Service {action} completed")
+        except Exception as e:
+            self.logger.error(f"Service control failed for action '{action}': {e}")
+            raise
+
     def safe_mkdir(self, path: Path):
         """Create directory if it doesn't exist, ignore if it does."""
         try:
@@ -50,6 +65,88 @@ class FirmwareUpdater:
         except Exception as e:
             self.logger.warning(f"Command execution warning for '{cmd}': {e}")
             return False
+
+    def mkdir(self):
+        """Create or recreate temporary directory."""
+        if self.temporary.exists():
+            shutil.rmtree(self.temporary)
+        self.temporary.mkdir(exist_ok=True)
+        self.logger.info(f"Created temporary directory {self.temporary}")
+
+    def read_file(self, file_path: Path) -> str:
+        """Read file content, stripping newlines."""
+        try:
+            return file_path.read_text().strip()
+        except Exception as e:
+            self.logger.error(f"Failed to read file {file_path}: {e}")
+            raise
+
+    def download_firmware(self):
+        """Download and extract the latest firmware."""
+        self.logger.info("Downloading firmware...")
+        url = f"https://cdn.sipeed.com/nanokvm/latest.zip?n={int(time.time())}"
+        zip_file = self.temporary / "latest.zip"
+        
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            
+            if response.headers.get("content-type") != "application/zip":
+                raise ValueError(f"Invalid content type: {response.headers.get('content-type')}")
+            
+            with zip_file.open('wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            with zipfile.ZipFile(zip_file) as zf:
+                zf.extractall(self.temporary)
+            
+            self.logger.info("Firmware download complete")
+        except Exception as e:
+            self.logger.error(f"Firmware download failed: {e}")
+            raise
+
+    def download_lib(self):
+        """Download and install library file."""
+        self.logger.info("Downloading library...")
+        try:
+            device_key = self.read_file(Path("/device_key"))
+            url = f"https://maixvision.sipeed.com/api/v1/nanokvm/encryption?uid={device_key}"
+            headers = {"token": "MaixVision2024"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            if response.headers.get("content-type") != "application/octet-stream":
+                raise ValueError(f"Invalid content type: {response.headers.get('content-type')}")
+            
+            lib_file = self.temporary / "libmaixcam_lib.so"
+            lib_file.write_bytes(response.content)
+            
+            lib_dir = self.temporary / "latest/kvm_system/dl_lib"
+            shutil.copy(lib_file, lib_dir)
+            self.logger.info("Library download complete")
+        except Exception as e:
+            self.logger.error(f"Library download failed: {e}")
+            raise
+
+    def update_firmware(self):
+        """Update firmware files with backup."""
+        if self.backup_dir.exists():
+            shutil.rmtree(self.backup_dir)
+        
+        if self.firmware_dir.exists():
+            shutil.move(str(self.firmware_dir), str(self.backup_dir))
+        
+        shutil.move(str(self.temporary / "latest"), str(self.firmware_dir))
+
+    def set_permissions(self):
+        """Set correct permissions on installed files."""
+        for root, dirs, files in os.walk(self.firmware_dir):
+            os.chmod(root, 0o755)
+            for file in files:
+                os.chmod(os.path.join(root, file), 0o755)
+        self.logger.info("Permissions updated")
 
     def setup_directories(self):
         """Setup required directories."""
@@ -111,8 +208,6 @@ class FirmwareUpdater:
             # Final cleanup of processes
             self.safe_execute("killall NanoKVM-Server 2>/dev/null || true")
             self.cleanup_files()
-
-    # ... (rest of the previous methods remain the same)
 
 def main():
     updater = FirmwareUpdater()
