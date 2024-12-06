@@ -5,10 +5,11 @@ import zipfile
 import requests
 import logging
 from pathlib import Path
-from subprocess import run, PIPE, STDOUT
+from subprocess import run, PIPE, STDOUT, Popen, DEVNULL
 
 class FirmwareUpdater:
     def __init__(self):
+        # Previous initialization code remains the same
         self.temporary = Path("/root/nanokvm-cache")
         self.backup_dir = Path("/root/old")
         self.firmware_dir = Path("/kvmapp")
@@ -16,7 +17,6 @@ class FirmwareUpdater:
         self.etc_kvm_dir = Path("/etc/kvm")
         self.service_name = "S95nanokvm"
         
-        # Configure logging
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
@@ -24,16 +24,22 @@ class FirmwareUpdater:
         self.logger = logging.getLogger(__name__)
 
     def service_control(self, action: str):
-        """Control the nanokvm service."""
+        """Control the nanokvm service with proper background execution."""
         try:
-            cmd = f"/etc/init.d/{self.service_name} {action}"
-            result = run(cmd, shell=True, stdout=PIPE, stderr=STDOUT, text=True)
+            if action == "stop":
+                # Stop service in foreground to ensure it completes
+                cmd = f"/etc/init.d/{self.service_name} {action}"
+                result = run(cmd, shell=True, stdout=PIPE, stderr=STDOUT, text=True)
+                if result.returncode != 0:
+                    self.logger.error(f"Service {action} failed with code {result.returncode}: {result.stdout}")
+                    raise RuntimeError(f"Service {action} failed")
+            else:
+                # Start/restart service in background
+                cmd = f"/etc/init.d/{self.service_name} {action} >/dev/null 2>&1 &"
+                Popen(cmd, shell=True, stdout=DEVNULL, stderr=DEVNULL, start_new_session=True)
+                time.sleep(2)  # Give the service a moment to start
             
-            if result.returncode != 0:
-                self.logger.error(f"Service {action} failed with code {result.returncode}: {result.stdout}")
-                raise RuntimeError(f"Service {action} failed")
-            
-            self.logger.info(f"Service {action} completed")
+            self.logger.info(f"Service {action} initiated")
         except Exception as e:
             self.logger.error(f"Service control failed for action '{action}': {e}")
             raise
@@ -188,14 +194,16 @@ class FirmwareUpdater:
             self.update_firmware()
             self.set_permissions()
             
-            # Additional setup and cleanup
             self.setup_directories()
             self.cleanup_files()
             self.handle_kernel_modules()
             
             version = self.read_file(self.firmware_dir / "version")
             self.logger.info(f"Update to version {version} successful")
-            self.logger.info("Restarting service...")
+            
+            # Start service in background and exit
+            self.logger.info("Starting service in background...")
+            self.service_control("restart")
             
         except Exception as e:
             self.logger.error(f"Update failed: {e}")
@@ -203,10 +211,10 @@ class FirmwareUpdater:
         finally:
             if self.temporary.exists():
                 shutil.rmtree(self.temporary)
-            self.service_control("restart")
             
-            # Final cleanup of processes
-            self.safe_execute("killall NanoKVM-Server 2>/dev/null || true")
+            # Cleanup processes without waiting
+            cleanup_cmd = "killall NanoKVM-Server >/dev/null 2>&1 || true &"
+            Popen(cleanup_cmd, shell=True, stdout=DEVNULL, stderr=DEVNULL, start_new_session=True)
             self.cleanup_files()
 
 def main():
